@@ -13,7 +13,7 @@ app = FastAPI()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CURRENTS_API_KEY = os.getenv("CURRENTS_API_KEY")
 
-# OpenAI client (создаём только если ключ есть)
+# Create OpenAI client only if key exists
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
@@ -23,7 +23,8 @@ class TopicIn(BaseModel):
 
 def get_recent_news(topic: str, limit: int = 5) -> List[str]:
     """
-    Возвращает список заголовков последних новостей по теме.
+    Returns a list of recent news titles by topic.
+    Soft-fails: never raises on Currents errors (so Zapier won't break).
     """
     if not CURRENTS_API_KEY:
         return ["(CURRENTS_API_KEY не задан — новости не подтягиваем)"]
@@ -35,9 +36,13 @@ def get_recent_news(topic: str, limit: int = 5) -> List[str]:
         "apiKey": CURRENTS_API_KEY,
     }
 
-    r = requests.get(url, params=params, timeout=15)
+    try:
+        r = requests.get(url, params=params, timeout=15)
+    except Exception:
+        return ["(Currents недоступен: network/timeout)"]
+
     if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Currents API error: {r.text}")
+        return [f"(Currents недоступен: {r.status_code})"]
 
     news = r.json().get("news", []) or []
     titles = [a.get("title", "").strip() for a in news if a.get("title")]
@@ -46,7 +51,8 @@ def get_recent_news(topic: str, limit: int = 5) -> List[str]:
 
 def gen_post_text(topic: str) -> str:
     """
-    Генерирует готовый текст Telegram-поста.
+    Generates a Telegram post text using OpenAI.
+    Raises HTTPException if OPENAI_API_KEY is missing (caller may fallback).
     """
     if not client:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY не задан")
@@ -68,22 +74,34 @@ def gen_post_text(topic: str) -> str:
 4) В конце подпись: — auto via code
 5) Хэштеги: #DER #ДГУ
 
-Не используй markdown-таблицы. Не добавляй лишние пояснения.
+Не используй таблицы. Не добавляй лишние пояснения.
 """.strip()
 
-    # Responses API (актуальный стиль) :contentReference[oaicite:2]{index=2}
-    resp = client.responses.create(
-        model="gpt-4o-mini",  # модель актуальна :contentReference[oaicite:3]{index=3}
-        input=[{"role": "user", "content": prompt}],
-        max_output_tokens=500,
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=500,
+        temperature=0.5,
     )
 
-    # Удобный текстовый вывод
-    text = resp.output_text.strip()
+    text = completion.choices[0].message.content.strip()
     if not text:
-        raise HTTPException(status_code=500, detail="Пустой ответ модели")
-
+        raise HTTPException(status_code=500, detail="Пустой ответ от модели")
     return text
+
+
+def fallback_post(topic: str, reason: str) -> str:
+    return (
+        "Пост (fallback) ✅\n\n"
+        f"Тема: {topic}\n\n"
+        "Короткий чеклист:\n"
+        "- Топливо / воздух / АКБ\n"
+        "- Ошибки контроллера и датчики\n"
+        "- Стартер / соленоид / пуск\n\n"
+        f"Причина fallback: {reason}\n\n"
+        "— auto via code\n"
+        "#DER #ДГУ"
+    )
 
 
 @app.get("/")
@@ -96,18 +114,27 @@ def heartbeat():
     return {"status": "OK"}
 
 
-# ✅ Удобно для Zapier: просто GET запрос
+# ✅ Main endpoint for Zapier (simple GET)
 @app.get("/generate")
 def generate(topic: str = Query("diesel generator troubleshooting")):
-    text = gen_post_text(topic)
-    return {"text": text}
+    try:
+        text = gen_post_text(topic)
+        return {"text": text}
+    except Exception as e:
+        # Never break Zapier: always return "text"
+        reason = f"{type(e).__name__}: {str(e)[:180]}"
+        return {"text": fallback_post(topic, reason)}
 
 
-# ✅ Если хочешь как в лекции POST с JSON
+# ✅ Optional POST endpoint (like in lecturer project)
 @app.post("/generate-post")
 def generate_post(body: TopicIn):
-    text = gen_post_text(body.topic)
-    return {"text": text}
+    try:
+        text = gen_post_text(body.topic)
+        return {"text": text}
+    except Exception as e:
+        reason = f"{type(e).__name__}: {str(e)[:180]}"
+        return {"text": fallback_post(body.topic, reason)}
 
 
 if __name__ == "__main__":
