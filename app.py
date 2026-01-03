@@ -113,6 +113,14 @@ def root():
 def heartbeat():
     return {"status": "OK"}
 
+@app.get("/news-test")
+def news_test(topic: str = Query("diesel generator")):
+    news = get_recent_news(topic)
+    return {
+        "topic": topic,
+        "count": len(news),
+        "news": news
+    }
 
 # ✅ Main endpoint for Zapier (simple GET)
 @app.get("/generate")
